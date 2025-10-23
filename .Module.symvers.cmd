@@ -1,1 +1,0 @@
-savedcmd_/home/mickey/Repos/kernel-time-server/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/mickey/Repos/kernel-time-server/Module.symvers -T /home/mickey/Repos/kernel-time-server/modules.order -i Module.symvers -e 

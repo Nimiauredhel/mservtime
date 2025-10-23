@@ -1,1 +1,0 @@
-savedcmd_/home/mickey/Repos/kernel-time-server/mservtime.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/mickey/Repos/kernel-time-server/mservtime.ko /home/mickey/Repos/kernel-time-server/mservtime.o /home/mickey/Repos/kernel-time-server/mservtime.mod.o
