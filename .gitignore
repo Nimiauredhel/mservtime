@@ -6,3 +6,5 @@
 *.mod.o
 *.o
 *.cmd
+compile_commands.json
+.cache/
