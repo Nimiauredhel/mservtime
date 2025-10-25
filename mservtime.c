@@ -13,7 +13,6 @@
 
 /* netfilter includes */
 #include <linux/netfilter.h>
-#include <linux/netfilter_netdev.h>
 
 #define BUFF_LEN (128)
 #define ITEM_SIZE (sizeof(struct sk_buff))
