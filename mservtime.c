@@ -9,15 +9,16 @@
 #include <linux/proc_fs.h>
 
 /* networking includes */
+#include <linux/if_ether.h>
+#include <linux/if_arp.h>
 #include <linux/ip.h>
-#include <linux/udp.h>
-#include <linux/tcp.h>
 
 /* netfilter includes */
 #include <linux/netfilter.h>
 #include <linux/netfilter_arp.h>
+#include <linux/netfilter_ipv4.h>
 
-#define BUFF_LEN (256)
+#define BUFF_LEN (128)
 #define ITEM_SIZE (sizeof(struct sk_buff))
 #define BUFF_SIZE (BUFF_LEN*ITEM_SIZE)
 
@@ -29,19 +30,29 @@ typedef struct PacketQueue
 } PacketQueue_t;
 
 static unsigned int arp_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
+static unsigned int ip_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
 static void cleanup(void);
 
 static struct task_struct *logger_task_ptr = NULL;
 static struct task_struct *echo_task_ptr = NULL;
 
-PacketQueue_t *q_to_log = NULL;
+PacketQueue_t *q_to_log_ip = NULL;
+PacketQueue_t *q_to_log_arp = NULL;
 PacketQueue_t *q_to_echo = NULL;
 
 struct nf_hook_ops arp_hook_ops =
 {
     .hook = (nf_hookfn *)arp_hook,
     .hooknum = NF_ARP_IN,
-    .pf = NFPROTO_INET,
+    .pf = NFPROTO_ARP,
+    .priority = 0,
+};
+
+struct nf_hook_ops ip_hook_ops =
+{
+    .hook = (nf_hookfn *)ip_hook,
+    .hooknum = NF_INET_PRE_ROUTING,
+    .pf = NFPROTO_IPV4,
     .priority = 0,
 };
 
@@ -53,10 +64,27 @@ static unsigned int arp_hook(void *priv, struct sk_buff *skb, const struct nf_ho
     }
 
     // place incoming skb in queue for the logging task
-    if (CIRC_SPACE(q_to_log->head, q_to_log->tail, BUFF_LEN) > 0)
+    if (CIRC_SPACE(q_to_log_arp->head, q_to_log_arp->tail, BUFF_LEN) > 0)
     {
-        q_to_log->circbuff[q_to_log->head] = *skb;
-        q_to_log->head =  (q_to_log->head + 1) % BUFF_LEN;
+        q_to_log_arp->circbuff[q_to_log_arp->head] = *skb;
+        q_to_log_arp->head =  (q_to_log_arp->head + 1) % BUFF_LEN;
+    }
+
+    return NF_ACCEPT;
+}
+
+static unsigned int ip_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+{
+    if (skb == NULL)
+    {
+        return NF_ACCEPT;
+    }
+
+    // place incoming skb in queue for the logging task
+    if (CIRC_SPACE(q_to_log_ip->head, q_to_log_ip->tail, BUFF_LEN) > 0)
+    {
+        q_to_log_ip->circbuff[q_to_log_ip->head] = *skb;
+        q_to_log_ip->head =  (q_to_log_ip->head + 1) % BUFF_LEN;
     }
 
     return NF_ACCEPT;
@@ -67,20 +95,57 @@ static int input_logger_task(void *data)
     printk(KERN_INFO "Logger Task START!\n");
 
     struct sk_buff skb_to_log = {0};
+    struct ethhdr *eth_header = NULL;
+    struct iphdr  *ip_header = NULL;
+    //struct arphdr *arp_header = NULL;
 
     while(!kthread_should_stop())
     {
-        if (CIRC_CNT(q_to_log->head, q_to_log->tail, BUFF_SIZE) > 0)
+        if (CIRC_CNT(q_to_log_ip->head, q_to_log_ip->tail, BUFF_SIZE) > 0)
         {
-            skb_to_log = q_to_log->circbuff[q_to_log->tail];
-            q_to_log->tail = (q_to_log->tail + 1) % BUFF_LEN;
+            skb_to_log = q_to_log_ip->circbuff[q_to_log_ip->tail];
+            q_to_log_ip->tail = (q_to_log_ip->tail + 1) % BUFF_LEN;
 
-            struct iphdr *ip_header = ip_hdr(&skb_to_log);
+            eth_header = eth_hdr(&skb_to_log);
+            ip_header = ip_hdr(&skb_to_log);
 
-            if (ip_header != NULL)
+            if (eth_header != NULL && ip_header != NULL)
             {
-                    printk(KERN_INFO "IP header caught:\nSource %pI4\nDestination %pI4\n",
-                    &(ip_header->saddr), &(ip_header->daddr));
+                    printk(KERN_INFO "IP packet caught:\nSource MAC [%X:%X:%X:%X:%X:%X]\nSource IP %pI4\nDestination MAC [%X:%X:%X:%X:%X:%X]\nDestination IP %pI4\n",
+                    eth_header->h_source[0], eth_header->h_source[1], eth_header->h_source[2],
+                    eth_header->h_source[3], eth_header->h_source[4], eth_header->h_source[5],
+                    &(ip_header->saddr),
+                    eth_header->h_dest[0], eth_header->h_dest[1], eth_header->h_dest[2],
+                    eth_header->h_dest[3], eth_header->h_dest[4], eth_header->h_dest[5],
+                    &(ip_header->daddr));
+            }
+
+            /*
+            while (CIRC_SPACE(q_to_echo->head, q_to_echo->tail, BUFF_SIZE) < 1)
+            {
+                fsleep(500000);
+            }
+
+            q_to_echo->circbuff[q_to_echo->head] = skb_to_log;
+            q_to_echo->head =  (q_to_echo->head + 1) % BUFF_LEN;
+            */
+            fsleep(50000);
+        }
+        else if (CIRC_CNT(q_to_log_arp->head, q_to_log_arp->tail, BUFF_SIZE) > 0)
+        {
+            skb_to_log = q_to_log_arp->circbuff[q_to_log_arp->tail];
+            q_to_log_arp->tail = (q_to_log_arp->tail + 1) % BUFF_LEN;
+
+            eth_header = eth_hdr(&skb_to_log);
+            //arp_header = arp_hdr(&skb_to_log);
+
+            if (eth_header != NULL)
+            {
+                printk(KERN_INFO "ARP packet caught:\nSource MAC [%X:%X:%X:%X:%X:%X]\nDestination MAC [%X:%X:%X:%X:%X:%X]\n",
+                eth_header->h_source[0], eth_header->h_source[1], eth_header->h_source[2],
+                eth_header->h_source[3], eth_header->h_source[4], eth_header->h_source[5],
+                eth_header->h_dest[0], eth_header->h_dest[1], eth_header->h_dest[2],
+                eth_header->h_dest[3], eth_header->h_dest[4], eth_header->h_dest[5]);
             }
 
             /*
@@ -133,6 +198,7 @@ static void cleanup(void)
     printk(KERN_INFO "Cleaning up module.\n");
 
     nf_unregister_net_hook(&init_net, &arp_hook_ops);
+    nf_unregister_net_hook(&init_net, &ip_hook_ops);
 
     if (logger_task_ptr != NULL)
     {
@@ -148,11 +214,18 @@ static void cleanup(void)
         echo_task_ptr = NULL;
     }
 
-    if (q_to_log != NULL)
+    if (q_to_log_ip != NULL)
     {
-        printk(KERN_INFO "Disposing of 'to log' queue.\n");
-        kfree(q_to_log);
-        q_to_log = NULL;
+        printk(KERN_INFO "Disposing of 'to log (ip)' queue.\n");
+        kfree(q_to_log_ip);
+        q_to_log_ip = NULL;
+    }
+
+    if (q_to_log_arp != NULL)
+    {
+        printk(KERN_INFO "Disposing of 'to log (arp)' queue.\n");
+        kfree(q_to_log_arp);
+        q_to_log_arp = NULL;
     }
 
     if (q_to_echo != NULL)
@@ -169,10 +242,12 @@ static int entry_point(void)
 {
     printk(KERN_INFO "Module START!\n");
 
-    q_to_log = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
+    q_to_log_ip = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
+    q_to_log_arp = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
     q_to_echo = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
 
-    if (q_to_log == NULL
+    if (q_to_log_ip == NULL
+        || q_to_log_arp == NULL
         || q_to_echo == NULL)
     {
         printk(KERN_WARNING "Failed to allocate packet queues.\n");
@@ -200,6 +275,7 @@ static int entry_point(void)
     }
 
     nf_register_net_hook(&init_net, &arp_hook_ops);
+    nf_register_net_hook(&init_net, &ip_hook_ops);
 
     printk(KERN_INFO "Started echo task.\n");
 
