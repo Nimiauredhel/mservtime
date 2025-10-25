@@ -1,89 +1,223 @@
+/* general kernel includes */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
+#include <linux/types.h>
 #include <linux/circ_buf.h>
+#include <linux/proc_fs.h>
+
+/* networking includes */
+#include <linux/ip.h>
+#include <linux/udp.h>
+#include <linux/tcp.h>
+
+/* netfilter includes */
+#include <linux/netfilter.h>
+#include <linux/netfilter_arp.h>
 
 #define BUFF_LEN (256)
-#define BUFF_SIZE (sizeof(int)*BUFF_LEN)
+#define ITEM_SIZE (sizeof(struct sk_buff))
+#define BUFF_SIZE (BUFF_LEN*ITEM_SIZE)
 
-static struct task_struct *listener_task_ptr = NULL;
-static struct task_struct *processing_task_ptr = NULL;
-
-static int *circbuff = NULL;
-static int head = 0;
-static int tail = 0;
-
-static int input_processing_task(void *data)
+typedef struct PacketQueue
 {
-    printk(KERN_INFO "Processing Task START!\n");
+    struct sk_buff circbuff[BUFF_LEN];
+    int head;
+    int tail;
+} PacketQueue_t;
+
+static unsigned int arp_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
+static void cleanup(void);
+
+static struct task_struct *logger_task_ptr = NULL;
+static struct task_struct *echo_task_ptr = NULL;
+
+PacketQueue_t *q_to_log = NULL;
+PacketQueue_t *q_to_echo = NULL;
+
+struct nf_hook_ops arp_hook_ops =
+{
+    .hook = (nf_hookfn *)arp_hook,
+    .hooknum = NF_ARP_IN,
+    .pf = NFPROTO_INET,
+    .priority = 0,
+};
+
+static unsigned int arp_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+{
+    if (skb == NULL)
+    {
+        return NF_ACCEPT;
+    }
+
+    // place incoming skb in queue for the logging task
+    if (CIRC_SPACE(q_to_log->head, q_to_log->tail, BUFF_LEN) > 0)
+    {
+        q_to_log->circbuff[q_to_log->head] = *skb;
+        q_to_log->head =  (q_to_log->head + 1) % BUFF_LEN;
+    }
+
+    return NF_ACCEPT;
+}
+
+static int input_logger_task(void *data)
+{
+    printk(KERN_INFO "Logger Task START!\n");
+
+    struct sk_buff skb_to_log = {0};
+
+    while(!kthread_should_stop())
+    {
+        if (CIRC_CNT(q_to_log->head, q_to_log->tail, BUFF_SIZE) > 0)
+        {
+            skb_to_log = q_to_log->circbuff[q_to_log->tail];
+            q_to_log->tail = (q_to_log->tail + 1) % BUFF_LEN;
+
+            struct iphdr *ip_header = ip_hdr(&skb_to_log);
+
+            if (ip_header != NULL)
+            {
+                    printk(KERN_INFO "IP header caught:\nSource %pI4\nDestination %pI4\n",
+                    &(ip_header->saddr), &(ip_header->daddr));
+            }
+
+            /*
+            while (CIRC_SPACE(q_to_echo->head, q_to_echo->tail, BUFF_SIZE) < 1)
+            {
+                fsleep(500000);
+            }
+
+            q_to_echo->circbuff[q_to_echo->head] = skb_to_log;
+            q_to_echo->head =  (q_to_echo->head + 1) % BUFF_LEN;
+            */
+            fsleep(50000);
+        }
+        else
+        {
+            fsleep(100000);
+        }
+    }
+
+    printk(KERN_INFO "Logger Task STOP!\n");
+
+    return 0;
+}
+
+static int input_echo_task(void *data)
+{
+    printk(KERN_INFO "Echo Task START!\n");
+
+    struct sk_buff skb_to_echo = {0};
 
     while(!kthread_should_stop())
     {
         fsleep(1000000);
+        /*
         if (CIRC_CNT(head, tail, BUFF_LEN) > 0)
         {
             printk("Processed random number [%d].\n", circbuff[tail]);
             tail = (tail + 1) % BUFF_LEN;
         }
+        */
     }
 
-    printk(KERN_INFO "Processing Task STOP!\n");
+    printk(KERN_INFO "Echo Task STOP!\n");
 
-    return 0;
-}
-
-static int input_listener_task(void *data)
-{
-    printk(KERN_INFO "Listener Task START!\n");
-
-    while(!kthread_should_stop())
-    {
-        fsleep(500000);
-        if (CIRC_SPACE(head, tail, BUFF_LEN) > 0)
-        {
-            get_random_bytes(circbuff+head, sizeof(int));
-            printk("Entered random number [%d].\n", circbuff[head]);
-            head = (head + 1) % BUFF_LEN;
-        }
-    }
-
-    printk(KERN_INFO "Listener Task STOP!\n");
-
-    return 0;
-}
-
-static int init(void)
-{
-    printk(KERN_INFO "Module START!\n");
-    circbuff = kmalloc(BUFF_SIZE, (GFP_KERNEL | __GFP_ZERO));
-    if (circbuff == NULL)
-    {
-        printk(KERN_WARNING "Failed to allocate buffer.\n");
-        return 1;
-    }
-    listener_task_ptr = kthread_run(input_processing_task, NULL, "ListenerTask");
-    processing_task_ptr = kthread_run(input_listener_task, NULL, "ProcessingTask");
     return 0;
 }
 
 static void cleanup(void)
 {
-    if (listener_task_ptr != NULL)
+    printk(KERN_INFO "Cleaning up module.\n");
+
+    nf_unregister_net_hook(&init_net, &arp_hook_ops);
+
+    if (logger_task_ptr != NULL)
     {
-        kthread_stop(listener_task_ptr);
+        printk(KERN_INFO "Stopping logger task.\n");
+        kthread_stop(logger_task_ptr);
+        logger_task_ptr = NULL;
     }
-    if (processing_task_ptr != NULL)
+
+    if (echo_task_ptr != NULL)
     {
-        kthread_stop(processing_task_ptr);
+        printk(KERN_INFO "Stopping echo task.\n");
+        kthread_stop(echo_task_ptr);
+        echo_task_ptr = NULL;
     }
-    kfree(circbuff);
+
+    if (q_to_log != NULL)
+    {
+        printk(KERN_INFO "Disposing of 'to log' queue.\n");
+        kfree(q_to_log);
+        q_to_log = NULL;
+    }
+
+    if (q_to_echo != NULL)
+    {
+        printk(KERN_INFO "Disposing of 'to echo' queue.\n");
+        kfree(q_to_echo);
+        q_to_echo = NULL;
+    }
+
+    printk(KERN_INFO "Cleanup complete.\n");
+}
+
+static int entry_point(void)
+{
+    printk(KERN_INFO "Module START!\n");
+
+    q_to_log = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
+    q_to_echo = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
+
+    if (q_to_log == NULL
+        || q_to_echo == NULL)
+    {
+        printk(KERN_WARNING "Failed to allocate packet queues.\n");
+        goto err;
+    }
+
+    printk(KERN_INFO "Allocated packet queues.\n");
+
+    logger_task_ptr = kthread_run(input_logger_task, NULL, "LoggerTask");
+
+    if (logger_task_ptr == NULL)
+    {
+        printk(KERN_WARNING "Failed to start logger task.\n");
+        goto err;
+    }
+
+    printk(KERN_INFO "Started logger task.\n");
+
+    echo_task_ptr = kthread_run(input_echo_task, NULL, "EchoTask");
+
+    if (echo_task_ptr == NULL)
+    {
+        printk(KERN_WARNING "Failed to start echo task.\n");
+        goto err;
+    }
+
+    nf_register_net_hook(&init_net, &arp_hook_ops);
+
+    printk(KERN_INFO "Started echo task.\n");
+
+    return 0;
+
+err:
+    cleanup();
+    return 1;
+}
+
+static void exit_point(void)
+{
+    cleanup();
     printk(KERN_INFO "Module END!\n");
 }
 
-module_init(init);
-module_exit(cleanup);
+module_init(entry_point);
+module_exit(exit_point);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mickey H.");
 MODULE_DESCRIPTION("A simple Linux Kernel Module");
