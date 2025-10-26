@@ -124,56 +124,73 @@ static int input_logger_task(void *data)
     return 0;
 }
 
+static void init_out_skb_template(struct sk_buff** out_skb_pptr, struct rtc_time **out_payload_pptr, struct ethhdr **out_ethhdr_pptr, struct iphdr **out_iphdr_pptr)
+{
+    int ip_header_len = 20;
+    int udp_header_len = 8;
+    int payload_len = sizeof(struct rtc_time);
+    size_t out_skb_size = ETH_HLEN + udp_header_len + ip_header_len + payload_len;
+
+    struct net_device *dev = dev_get_by_name(&init_net, "wlp1s0");
+
+    *out_skb_pptr = alloc_skb(out_skb_size, GFP_KERNEL);
+
+    (*out_skb_pptr)->pkt_type = PACKET_OUTGOING;
+    skb_reserve(*out_skb_pptr, ETH_HLEN+udp_header_len+ip_header_len);
+
+    (*out_skb_pptr)->protocol = htons(ETH_P_IP);
+    (*out_skb_pptr)->no_fcs = 1;
+
+    *out_payload_pptr = skb_put(*out_skb_pptr, payload_len);
+
+    // udp header
+    struct udphdr *template_udp_header = (struct udphdr *)skb_push(*out_skb_pptr, udp_header_len);
+    template_udp_header->len = udp_header_len + payload_len;
+    template_udp_header->source = htons(45678);
+    template_udp_header->dest = htons(56789);
+    // ip header
+    *out_iphdr_pptr = (struct iphdr *)skb_push(*out_skb_pptr, ip_header_len);
+    (*out_iphdr_pptr)->ihl = ip_header_len/4; // TODO: what?
+    (*out_iphdr_pptr)->version = 4;
+    (*out_iphdr_pptr)->tos = 0;
+    (*out_iphdr_pptr)->tot_len = htons(ip_header_len+udp_header_len+payload_len);
+    (*out_iphdr_pptr)->frag_off = 0;
+    (*out_iphdr_pptr)->ttl = 64;
+    (*out_iphdr_pptr)->protocol = IPPROTO_UDP;
+    (*out_iphdr_pptr)->check = 0;
+    (*out_iphdr_pptr)->saddr = 0x00000000;
+    (*out_iphdr_pptr)->daddr = 0x00000000;
+    // eth header
+    *out_ethhdr_pptr = (struct ethhdr *)skb_push(*out_skb_pptr, sizeof(struct ethhdr));
+    (*out_ethhdr_pptr)->h_proto = htons(ETH_P_IP);
+    memcpy((*out_ethhdr_pptr)->h_source, dev->dev_addr, ETH_ALEN);
+}
+
 static int input_echo_task(void *data)
 {
     printk(KERN_INFO "Echo Task START!\n");
 
     struct sk_buff *skb_to_echo = NULL;
     struct sk_buff *out_skb = NULL;
+    struct rtc_time timestamp = {0};
 
     // prepare out skb template
-    int ip_header_len = 20;
-    int udp_header_len = 8;
-    int payload_len = sizeof(struct rtc_time);
-
-    struct rtc_time out_time = {0};
-    size_t out_skb_size = ETH_HLEN + udp_header_len + ip_header_len + payload_len;
-    struct sk_buff *out_skb_template = alloc_skb(out_skb_size, GFP_KERNEL);
-    struct net_device *dev = dev_get_by_name(&init_net, "wlp1s0");
-    out_skb_template->pkt_type = PACKET_OUTGOING;
-    skb_reserve(out_skb_template, ETH_HLEN+udp_header_len+ip_header_len);
-    uint8_t *template_payload = skb_put(out_skb_template, udp_header_len+payload_len);
-    // udp header
-    struct udphdr *template_udp_header = (struct udphdr *)skb_push(out_skb_template, udp_header_len);
-    template_udp_header->len = udp_header_len + payload_len;
-    template_udp_header->source = htons(45678);
-    template_udp_header->dest = htons(56789);
-    // ip header
-    struct iphdr *template_ip_header = (struct iphdr *)skb_push(out_skb_template, ip_header_len);
-    template_ip_header->ihl = ip_header_len/4; // TODO: what?
-    template_ip_header->version = 4;
-    template_ip_header->tos = 0;
-    template_ip_header->tot_len = htons(ip_header_len+udp_header_len+payload_len);
-    template_ip_header->frag_off = 0;
-    template_ip_header->ttl = 64;
-    template_ip_header->protocol = IPPROTO_UDP;
-    template_ip_header->check = 0;
-    template_ip_header->saddr = 0;
-    template_ip_header->daddr = 0;
-    // eth header
-    struct ethhdr *template_eth_header = (struct ethhdr *)skb_push(out_skb_template, sizeof(struct ethhdr));
-    out_skb_template->protocol = template_eth_header->h_proto = htons(ETH_P_IP);
-    out_skb_template->no_fcs = 1;
-    memcpy(template_eth_header->h_source, dev->dev_addr, ETH_ALEN);
+    struct sk_buff *out_skb_template = NULL;
+    struct rtc_time *out_payload = NULL;
+    struct ethhdr *template_eth_header = NULL;
+    struct iphdr *template_ip_header = NULL;
+    init_out_skb_template(&out_skb_template, &out_payload, &template_eth_header, &template_ip_header);
 
     // packet processing loop
     while(!kthread_should_stop())
     {
         if (CIRC_CNT(q_to_log->head, q_to_log->tail, BUFF_SIZE) > 0)
         {
-            // acquire pointer of skb to echo and parse headers
+            // acquire pointer of skb to echo
             skb_to_echo = q_to_log->circbuff[q_to_log->tail];
             q_to_log->tail = (q_to_log->tail + 1) % BUFF_LEN;
+
+            // parse eth and ip headers from current skb
             struct ethhdr *current_eth_header = eth_hdr(skb_to_echo);
             struct iphdr *current_ip_hdr = ip_hdr(skb_to_echo);
 
@@ -184,18 +201,25 @@ static int input_echo_task(void *data)
             // release skb to echo now that it's no longer useful
             kfree_skb(skb_to_echo);
 
-            // write payload (timestamp) into template
-            out_time = rtc_ktime_to_tm(ktime_get_real());
-            memcpy(template_payload, &out_time, sizeof(out_time));
+            // get timestamp and write it into template payload
+            timestamp = rtc_ktime_to_tm(ktime_get_real());
+            out_payload->tm_sec   = htonl(timestamp.tm_sec);
+            out_payload->tm_min   = htonl(timestamp.tm_min);
+            out_payload->tm_hour  = htonl(timestamp.tm_hour);
+            out_payload->tm_mday  = htonl(timestamp.tm_mday);
+            out_payload->tm_wday  = htonl(timestamp.tm_wday);
+            out_payload->tm_yday  = htonl(timestamp.tm_yday);
+            out_payload->tm_year  = htonl(timestamp.tm_year);
+            out_payload->tm_isdst = htonl(timestamp.tm_isdst);
 
             // copy template and send the copy
             out_skb = skb_copy(out_skb_template, GFP_KERNEL);
 
             if (out_skb != NULL)
             {
+                // NOTE: skb is consumed by xmit, no need to free!
                 dev_queue_xmit(out_skb);
-                // release copy
-                kfree_skb(out_skb);
+                out_skb = NULL;
             }
 
             fsleep(50000);
