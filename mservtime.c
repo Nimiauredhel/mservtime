@@ -19,8 +19,6 @@
 #include <linux/netfilter.h>
 
 #define BUFF_LEN (128)
-#define ITEM_SIZE (sizeof(struct sk_buff *))
-#define BUFF_SIZE (BUFF_LEN*ITEM_SIZE)
 
 typedef struct PacketQueue
 {
@@ -72,7 +70,7 @@ static int input_logger_task(void *data)
 
     while(!kthread_should_stop())
     {
-        if (CIRC_CNT(q_to_log->head, q_to_log->tail, BUFF_SIZE) > 0)
+        if (CIRC_CNT(q_to_log->head, q_to_log->tail, BUFF_LEN) > 0)
         {
             skb_to_log = q_to_log->circbuff[q_to_log->tail];
             q_to_log->tail = (q_to_log->tail + 1) % BUFF_LEN;
@@ -90,7 +88,7 @@ static int input_logger_task(void *data)
                     eth_header->h_dest[3], eth_header->h_dest[4], eth_header->h_dest[5]);
             }
 
-            while (CIRC_SPACE(q_to_echo->head, q_to_echo->tail, BUFF_SIZE) < 1)
+            while (CIRC_SPACE(q_to_echo->head, q_to_echo->tail, BUFF_LEN) < 1)
             {
                 fsleep(500000);
             }
@@ -108,7 +106,7 @@ static int input_logger_task(void *data)
 
     printk(KERN_INFO "Logger task cleaning remaining SKBs in queue.\n");
 
-    while (CIRC_CNT(q_to_log->head, q_to_log->tail, BUFF_SIZE) > 0)
+    while (CIRC_CNT(q_to_log->head, q_to_log->tail, BUFF_LEN) > 0)
     {
         skb_to_log = q_to_log->circbuff[q_to_log->tail];
         q_to_log->tail = (q_to_log->tail + 1) % BUFF_LEN;
@@ -126,31 +124,33 @@ static int input_logger_task(void *data)
 
 static void init_out_skb_template(struct sk_buff** out_skb_pptr, struct rtc_time **out_payload_pptr, struct ethhdr **out_ethhdr_pptr, struct iphdr **out_iphdr_pptr)
 {
+    printk(KERN_INFO "Initializing outgoing skb template.\n");
+
     int ip_header_len = 20;
     int udp_header_len = 8;
     int payload_len = sizeof(struct rtc_time);
-    size_t out_skb_size = ETH_HLEN + udp_header_len + ip_header_len + payload_len;
-
-    struct net_device *dev = dev_get_by_name(&init_net, "wlp1s0");
+    int out_skb_size = ETH_HLEN + ip_header_len + udp_header_len + payload_len;
 
     *out_skb_pptr = alloc_skb(out_skb_size, GFP_KERNEL);
 
     (*out_skb_pptr)->pkt_type = PACKET_OUTGOING;
     skb_reserve(*out_skb_pptr, ETH_HLEN+udp_header_len+ip_header_len);
 
+    (*out_skb_pptr)->dev = ingress_hook_ops.dev;
     (*out_skb_pptr)->protocol = htons(ETH_P_IP);
     (*out_skb_pptr)->no_fcs = 1;
+    (*out_skb_pptr)->ip_summed = CHECKSUM_PARTIAL;
 
     *out_payload_pptr = skb_put(*out_skb_pptr, payload_len);
 
     // udp header
     struct udphdr *template_udp_header = (struct udphdr *)skb_push(*out_skb_pptr, udp_header_len);
-    template_udp_header->len = udp_header_len + payload_len;
+    template_udp_header->len = htons(udp_header_len + payload_len);
     template_udp_header->source = htons(45678);
     template_udp_header->dest = htons(56789);
     // ip header
     *out_iphdr_pptr = (struct iphdr *)skb_push(*out_skb_pptr, ip_header_len);
-    (*out_iphdr_pptr)->ihl = ip_header_len/4; // TODO: what?
+    (*out_iphdr_pptr)->ihl = ip_header_len/4;
     (*out_iphdr_pptr)->version = 4;
     (*out_iphdr_pptr)->tos = 0;
     (*out_iphdr_pptr)->tot_len = htons(ip_header_len+udp_header_len+payload_len);
@@ -163,7 +163,9 @@ static void init_out_skb_template(struct sk_buff** out_skb_pptr, struct rtc_time
     // eth header
     *out_ethhdr_pptr = (struct ethhdr *)skb_push(*out_skb_pptr, sizeof(struct ethhdr));
     (*out_ethhdr_pptr)->h_proto = htons(ETH_P_IP);
-    memcpy((*out_ethhdr_pptr)->h_source, dev->dev_addr, ETH_ALEN);
+    memcpy((*out_ethhdr_pptr)->h_source, ingress_hook_ops.dev->dev_addr, ETH_ALEN);
+
+    printk(KERN_INFO "Outgoing skb template initialized.\n");
 }
 
 static int input_echo_task(void *data)
@@ -171,7 +173,6 @@ static int input_echo_task(void *data)
     printk(KERN_INFO "Echo Task START!\n");
 
     struct sk_buff *skb_to_echo = NULL;
-    struct sk_buff *out_skb = NULL;
     struct rtc_time timestamp = {0};
 
     // prepare out skb template
@@ -184,11 +185,11 @@ static int input_echo_task(void *data)
     // packet processing loop
     while(!kthread_should_stop())
     {
-        if (CIRC_CNT(q_to_log->head, q_to_log->tail, BUFF_SIZE) > 0)
+        if (CIRC_CNT(q_to_echo->head, q_to_echo->tail, BUFF_LEN) > 0)
         {
             // acquire pointer of skb to echo
-            skb_to_echo = q_to_log->circbuff[q_to_log->tail];
-            q_to_log->tail = (q_to_log->tail + 1) % BUFF_LEN;
+            skb_to_echo = q_to_echo->circbuff[q_to_echo->tail];
+            q_to_echo->tail = (q_to_echo->tail + 1) % BUFF_LEN;
 
             // parse eth and ip headers from current skb
             struct ethhdr *current_eth_header = eth_hdr(skb_to_echo);
@@ -213,14 +214,8 @@ static int input_echo_task(void *data)
             out_payload->tm_isdst = htonl(timestamp.tm_isdst);
 
             // copy template and send the copy
-            out_skb = skb_copy(out_skb_template, GFP_KERNEL);
-
-            if (out_skb != NULL)
-            {
-                // NOTE: skb is consumed by xmit, no need to free!
-                dev_queue_xmit(out_skb);
-                out_skb = NULL;
-            }
+            dev_queue_xmit(skb_copy(out_skb_template, GFP_KERNEL));
+            printk(KERN_INFO "Echo Task responded with timestamp!\n");
 
             fsleep(50000);
         }
@@ -234,7 +229,7 @@ static int input_echo_task(void *data)
 
     printk(KERN_INFO "Echo task cleaning remaining SKBs in queue.\n");
 
-    while (CIRC_CNT(q_to_echo->head, q_to_echo->tail, BUFF_SIZE) > 0)
+    while (CIRC_CNT(q_to_echo->head, q_to_echo->tail, BUFF_LEN) > 0)
     {
         skb_to_echo = q_to_echo->circbuff[q_to_echo->tail];
         q_to_echo->tail = (q_to_echo->tail + 1) % BUFF_LEN;
@@ -290,6 +285,8 @@ static void cleanup(void)
 static int entry_point(void)
 {
     printk(KERN_INFO "Module START!\n");
+
+    ingress_hook_ops.dev = dev_get_by_name(&init_net, "wlp1s0");
 
     q_to_log = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
     q_to_echo = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
