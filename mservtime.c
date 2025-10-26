@@ -14,6 +14,9 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/udp.h>
+#include <linux/netdevice.h>
+#include <linux/if_addr.h>
+#include <linux/inetdevice.h>
 
 /* netfilter includes */
 #include <linux/netfilter.h>
@@ -131,6 +134,9 @@ static void init_out_skb_template(struct sk_buff** out_skb_pptr, struct rtc_time
     int payload_len = sizeof(struct rtc_time);
     int out_skb_size = ETH_HLEN + ip_header_len + udp_header_len + payload_len;
 
+    struct in_device *dev_ip_ptr = (struct in_device *)(ingress_hook_ops.dev->ip_ptr);
+    __be32 dev_ip_addr = dev_ip_ptr->ifa_list->ifa_address;
+
     *out_skb_pptr = alloc_skb(out_skb_size, GFP_KERNEL);
 
     (*out_skb_pptr)->pkt_type = PACKET_OUTGOING;
@@ -158,7 +164,7 @@ static void init_out_skb_template(struct sk_buff** out_skb_pptr, struct rtc_time
     (*out_iphdr_pptr)->ttl = 64;
     (*out_iphdr_pptr)->protocol = IPPROTO_UDP;
     (*out_iphdr_pptr)->check = 0;
-    (*out_iphdr_pptr)->saddr = 0x00000000;
+    (*out_iphdr_pptr)->saddr = dev_ip_addr;
     (*out_iphdr_pptr)->daddr = 0x00000000;
     // eth header
     *out_ethhdr_pptr = (struct ethhdr *)skb_push(*out_skb_pptr, sizeof(struct ethhdr));
