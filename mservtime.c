@@ -7,6 +7,8 @@
 #include <linux/types.h>
 #include <linux/circ_buf.h>
 #include <linux/proc_fs.h>
+#include <linux/ktime.h>
+#include <linux/rtc.h>
 
 /* networking includes */
 #include <linux/if_ether.h>
@@ -77,14 +79,15 @@ static int input_logger_task(void *data)
 
             if (eth_header != NULL)
             {
-                    printk(KERN_INFO "Packet caught:\nSource MAC [%X:%X:%X:%X:%X:%X]\nDestination MAC [%X:%X:%X:%X:%X:%X]\n",
+                    struct rtc_time t = rtc_ktime_to_tm(ktime_get_real());
+                    printk(KERN_INFO "Packet @ %ptRs\nSource [%X:%X:%X:%X:%X:%X]\nDestination [%X:%X:%X:%X:%X:%X]\n",
+                    &t,
                     eth_header->h_source[0], eth_header->h_source[1], eth_header->h_source[2],
                     eth_header->h_source[3], eth_header->h_source[4], eth_header->h_source[5],
                     eth_header->h_dest[0], eth_header->h_dest[1], eth_header->h_dest[2],
                     eth_header->h_dest[3], eth_header->h_dest[4], eth_header->h_dest[5]);
             }
 
-            /*
             while (CIRC_SPACE(q_to_echo->head, q_to_echo->tail, BUFF_SIZE) < 1)
             {
                 fsleep(500000);
@@ -92,7 +95,7 @@ static int input_logger_task(void *data)
 
             q_to_echo->circbuff[q_to_echo->head] = skb_to_log;
             q_to_echo->head =  (q_to_echo->head + 1) % BUFF_LEN;
-            */
+
             fsleep(50000);
         }
         else
@@ -111,17 +114,27 @@ static int input_echo_task(void *data)
     printk(KERN_INFO "Echo Task START!\n");
 
     struct sk_buff skb_to_echo = {0};
+    struct sk_buff *out_skb_ptr = NULL;;
 
     while(!kthread_should_stop())
     {
         fsleep(1000000);
-        /*
-        if (CIRC_CNT(head, tail, BUFF_LEN) > 0)
+
+        if (CIRC_CNT(q_to_log->head, q_to_log->tail, BUFF_SIZE) > 0)
         {
-            printk("Processed random number [%d].\n", circbuff[tail]);
-            tail = (tail + 1) % BUFF_LEN;
+            skb_to_echo = q_to_log->circbuff[q_to_log->tail];
+            q_to_log->tail = (q_to_log->tail + 1) % BUFF_LEN;
+
+            /*
+            out_skb_ptr = kmalloc(sizeof(struct sk_buff), (GFP_KERNEL | __GFP_ZERO));
+
+            if (out_skb_ptr != NULL)
+            {
+                *out_skb_ptr = skb_to_echo;
+                dev_queue_xmit(out_skb_ptr);
+            }
+            */
         }
-        */
     }
 
     printk(KERN_INFO "Echo Task STOP!\n");
