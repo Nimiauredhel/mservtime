@@ -26,7 +26,16 @@
 #include <linux/fs.h>
 
 #define CHAR_DEV_MSG_MAX_LEN (128)
+#define CHAR_DEV_QUEUE_LEN (32)
 #define BUFF_LEN (128)
+
+typedef enum ControlState
+{
+    CSTATE_NONE = 0,
+    CSTATE_PREINIT = 1,
+    CSTATE_IDLE = 2,
+    CSTATE_CAPTURING = 3,
+} ControlState_t;
 
 typedef struct PacketQueue
 {
@@ -35,6 +44,15 @@ typedef struct PacketQueue
     int tail;
 } PacketQueue_t;
 
+typedef struct CharQueue
+{
+    char circbuff[CHAR_DEV_QUEUE_LEN][CHAR_DEV_MSG_MAX_LEN+1];
+    int head;
+    int tail;
+} CharQueue_t;
+
+static int start_capture(void);
+static void stop_capture(void);
 static unsigned int ingress_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
 static void cleanup(void);
 
@@ -43,13 +61,22 @@ static int char_dev_release(struct inode *inode, struct file *file);
 static ssize_t char_dev_read(struct file *file, char __user *buf, size_t count, loff_t *offset);
 static ssize_t char_dev_write(struct file *file, const char __user *buf, size_t count, loff_t *offset);
 
+/* structural variables */
+static uint8_t current_state = CSTATE_NONE;
+static uint8_t requested_state = CSTATE_NONE;
+
+static struct task_struct *control_task_ptr = NULL;
 static struct task_struct *logger_task_ptr = NULL;
 static struct task_struct *echo_task_ptr = NULL;
 
-PacketQueue_t *q_to_log = NULL;
-PacketQueue_t *q_to_echo = NULL;
+static PacketQueue_t *q_to_log = NULL;
+static PacketQueue_t *q_to_echo = NULL;
+static CharQueue_t *q_to_device = NULL;
 
-struct nf_hook_ops ingress_hook_ops =
+/* netfilter variables */
+static char *interface_name = NULL;
+
+static struct nf_hook_ops ingress_hook_ops =
 {
     .hook = (nf_hookfn *)ingress_hook,
     .hooknum = NF_NETDEV_INGRESS,
@@ -95,40 +122,83 @@ static void char_dev_deinit(void)
 
 static int char_dev_open(struct inode *inode, struct file *file)
 {
+    if (current_state < CSTATE_IDLE) return 1;
     printk("Device opened.\n");
     return 0;
 }
 
 static int char_dev_release(struct inode *inode, struct file *file)
 {
+    if (current_state < CSTATE_IDLE) return 1;
     printk("Device closed.\n");
     return 0;
 }
 
 static ssize_t char_dev_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
-    uint8_t *data = "Char device test message.\n\0";
-    size_t data_len = strlen(data);
-    size_t copied = 0;
+    if (current_state < CSTATE_IDLE || q_to_device == NULL) return 0;
 
-    copied = copy_to_user(buf, data, data_len);
+    if (CIRC_CNT(q_to_device->head, q_to_device->tail, CHAR_DEV_QUEUE_LEN) > 0)
+    {
+        uint8_t *data = q_to_device->circbuff[q_to_device->tail];
+        size_t data_len = strlen(data);
+        size_t copied = 0;
 
-    printk("Device read len %lu/%lu: %s\n", data_len, count, data);
-    return data_len;
+        if (count < data_len) data_len = count;
+
+        copied = copy_to_user(buf, data, data_len);
+
+        printk("Device read len %lu/%lu: %s\n", data_len, count, data);
+
+        q_to_device->tail = (q_to_device->tail + 1) % CHAR_DEV_QUEUE_LEN;
+
+        return data_len;
+    }
+    else return 0;
 }
 
 static ssize_t char_dev_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
 {
-    size_t max_len = CHAR_DEV_MSG_MAX_LEN;
+    if (current_state < CSTATE_IDLE) return count;
+    if (interface_name == NULL) return count;
+
+    size_t copy_len = CHAR_DEV_MSG_MAX_LEN;
     size_t copied = 0;
-    char data[CHAR_DEV_MSG_MAX_LEN+1];
 
-    if (count < max_len) max_len = count;
+    if (count < copy_len) copy_len = count;
 
-    copied = copy_from_user(data, buf, max_len);
-    data[CHAR_DEV_MSG_MAX_LEN] = 0;
+    if (current_state == CSTATE_CAPTURING)
+    {
+        requested_state = CSTATE_IDLE;
 
-    printk("Device write: %s\n", data);
+        while(current_state > CSTATE_IDLE)
+        {
+            fsleep(500000);
+        }
+    }
+
+    copied = copy_from_user(interface_name, buf, copy_len);
+    interface_name[copy_len] = '\0';
+
+    if (count == 0 || interface_name[0] == ' ' || interface_name[0] == '\0')
+    {
+        printk("Capture stopped by user.\n");
+    }
+    else
+    {
+        ingress_hook_ops.dev = dev_get_by_name(&init_net, interface_name);
+
+        if (ingress_hook_ops.dev == NULL)
+        {
+            printk("Failed to assign interface name: %s\n", interface_name);
+        }
+        else
+        {
+            printk("New interface name assigned: %s\n", interface_name);
+            requested_state = CSTATE_CAPTURING;
+        }
+    }
+
     return count;
 }
 
@@ -149,12 +219,49 @@ static unsigned int ingress_hook(void *priv, struct sk_buff *skb, const struct n
     return NF_ACCEPT;
 }
 
+static int control_task(void *data)
+{
+    printk(KERN_INFO "Control Task START!\n");
+
+    while(!kthread_should_stop())
+    {
+        if (requested_state > CSTATE_NONE && requested_state != current_state)
+        {
+            switch(requested_state)
+            {
+                case CSTATE_CAPTURING:
+                    if (current_state == CSTATE_IDLE) start_capture();
+                    break;
+                case CSTATE_IDLE:
+                    if (current_state == CSTATE_CAPTURING) stop_capture();
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        fsleep(500000);
+    }
+
+    printk(KERN_INFO "Control Task STOP!\n");
+
+    return 0;
+}
+
 static int input_logger_task(void *data)
 {
     printk(KERN_INFO "Logger Task START!\n");
 
     struct sk_buff *skb_to_log = NULL;
     struct ethhdr *eth_header = NULL;
+
+    char *log = kmalloc(CHAR_DEV_MSG_MAX_LEN+1, (GFP_KERNEL | __GFP_ZERO));
+
+    if (log == NULL)
+    {
+        printk(KERN_INFO "Logger Task failed to allocate log string, quitting.\n");
+        return 1;
+    }
 
     while(!kthread_should_stop())
     {
@@ -167,22 +274,37 @@ static int input_logger_task(void *data)
 
             if (eth_header != NULL)
             {
-                    struct rtc_time t = rtc_ktime_to_tm(ktime_get_real());
-                    printk(KERN_INFO "Packet @ %ptRs\nSource [%X:%X:%X:%X:%X:%X]\nDestination [%X:%X:%X:%X:%X:%X]\n",
-                    &t,
-                    eth_header->h_source[0], eth_header->h_source[1], eth_header->h_source[2],
-                    eth_header->h_source[3], eth_header->h_source[4], eth_header->h_source[5],
-                    eth_header->h_dest[0], eth_header->h_dest[1], eth_header->h_dest[2],
-                    eth_header->h_dest[3], eth_header->h_dest[4], eth_header->h_dest[5]);
-            }
+                struct rtc_time t = rtc_ktime_to_tm(ktime_get_real());
+                snprintf(log, CHAR_DEV_MSG_MAX_LEN, "Packet @ %ptRs\nSource [%X:%X:%X:%X:%X:%X]\nDestination [%X:%X:%X:%X:%X:%X]\n",
+                &t,
+                eth_header->h_source[0], eth_header->h_source[1], eth_header->h_source[2],
+                eth_header->h_source[3], eth_header->h_source[4], eth_header->h_source[5],
+                eth_header->h_dest[0], eth_header->h_dest[1], eth_header->h_dest[2],
+                eth_header->h_dest[3], eth_header->h_dest[4], eth_header->h_dest[5]);
 
-            while (CIRC_SPACE(q_to_echo->head, q_to_echo->tail, BUFF_LEN) < 1)
+                printk(KERN_INFO "%s", log);
+
+                while (CIRC_SPACE(q_to_echo->head, q_to_echo->tail, BUFF_LEN) < 1)
+                {
+                    fsleep(500000);
+                }
+
+                q_to_echo->circbuff[q_to_echo->head] = skb_to_log;
+                q_to_echo->head =  (q_to_echo->head + 1) % BUFF_LEN;
+
+                if (CIRC_SPACE(q_to_device->head, q_to_device->tail, CHAR_DEV_QUEUE_LEN) > 0)
+                {
+                    snprintf(q_to_device->circbuff[q_to_device->head], CHAR_DEV_MSG_MAX_LEN, log);
+                    q_to_device->circbuff[q_to_device->head][CHAR_DEV_MSG_MAX_LEN] = 0;
+                    q_to_device->head = (q_to_device->head + 1) % CHAR_DEV_QUEUE_LEN;
+                }
+            }
+            else
             {
-                fsleep(500000);
+                kfree_skb(skb_to_log);
             }
 
-            q_to_echo->circbuff[q_to_echo->head] = skb_to_log;
-            q_to_echo->head =  (q_to_echo->head + 1) % BUFF_LEN;
+            skb_to_log = NULL;
 
             fsleep(50000);
         }
@@ -192,6 +314,10 @@ static int input_logger_task(void *data)
         }
     }
 
+    if (log != NULL)
+    {
+        kfree(log);
+    }
     printk(KERN_INFO "Logger task cleaning remaining SKBs in queue.\n");
 
     while (CIRC_CNT(q_to_log->head, q_to_log->tail, BUFF_LEN) > 0)
@@ -336,63 +462,15 @@ static int input_echo_task(void *data)
     return 0;
 }
 
-static void cleanup(void)
+static int start_capture(void)
 {
-    printk(KERN_INFO "Cleaning up module.\n");
-
-    char_dev_deinit();
-    nf_unregister_net_hook(&init_net, &ingress_hook_ops);
-
-    if (logger_task_ptr != NULL)
+    if (ingress_hook_ops.dev == NULL)
     {
-        printk(KERN_INFO "Stopping logger task.\n");
-        kthread_stop(logger_task_ptr);
-        logger_task_ptr = NULL;
+        printk(KERN_INFO "Invalid device specified, aborting capture.\n");
+        return 1;
     }
 
-    if (echo_task_ptr != NULL)
-    {
-        printk(KERN_INFO "Stopping echo task.\n");
-        kthread_stop(echo_task_ptr);
-        echo_task_ptr = NULL;
-    }
-
-    if (q_to_log != NULL)
-    {
-        printk(KERN_INFO "Disposing of 'to log' queue.\n");
-        kfree(q_to_log);
-        q_to_log = NULL;
-    }
-
-    if (q_to_echo != NULL)
-    {
-        printk(KERN_INFO "Disposing of 'to echo' queue.\n");
-        kfree(q_to_echo);
-        q_to_echo = NULL;
-    }
-
-    printk(KERN_INFO "Cleanup complete.\n");
-}
-
-static int entry_point(void)
-{
-    printk(KERN_INFO "Module START!\n");
-
-    char_dev_init();
-
-    ingress_hook_ops.dev = dev_get_by_name(&init_net, "wlp1s0");
-
-    q_to_log = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
-    q_to_echo = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
-
-    if (q_to_log == NULL
-        || q_to_echo == NULL)
-    {
-        printk(KERN_WARNING "Failed to allocate packet queues.\n");
-        goto err;
-    }
-
-    printk(KERN_INFO "Allocated packet queues.\n");
+    current_state = CSTATE_CAPTURING;
 
     logger_task_ptr = kthread_run(input_logger_task, NULL, "LoggerTask");
 
@@ -416,6 +494,136 @@ static int entry_point(void)
 
     printk(KERN_INFO "Started echo task.\n");
 
+    return 0;
+
+err:
+    cleanup();
+    return 1;
+}
+
+static void stop_capture(void)
+{
+    current_state = CSTATE_IDLE;
+
+    nf_unregister_net_hook(&init_net, &ingress_hook_ops);
+
+    if (logger_task_ptr != NULL)
+    {
+        printk(KERN_INFO "Stopping logger task.\n");
+        kthread_stop(logger_task_ptr);
+        logger_task_ptr = NULL;
+    }
+
+    if (echo_task_ptr != NULL)
+    {
+        printk(KERN_INFO "Stopping echo task.\n");
+        kthread_stop(echo_task_ptr);
+        echo_task_ptr = NULL;
+    }
+}
+
+static void cleanup(void)
+{
+    if (control_task_ptr != NULL)
+    {
+        printk(KERN_INFO "Stopping control task.\n");
+        kthread_stop(control_task_ptr);
+        control_task_ptr = NULL;
+    }
+
+    if (current_state == CSTATE_CAPTURING)
+    {
+        stop_capture();
+    }
+
+    current_state = CSTATE_PREINIT;
+
+    printk(KERN_INFO "Cleaning up module.\n");
+
+    char_dev_deinit();
+
+    if (interface_name != NULL)
+    {
+        printk(KERN_INFO "Disposing of 'interface name' string.\n");
+        kfree(interface_name);
+        interface_name = NULL;
+    }
+
+    if (q_to_log != NULL)
+    {
+        printk(KERN_INFO "Disposing of 'to log' queue.\n");
+        kfree(q_to_log);
+        q_to_log = NULL;
+    }
+
+    if (q_to_echo != NULL)
+    {
+        printk(KERN_INFO "Disposing of 'to echo' queue.\n");
+        kfree(q_to_echo);
+        q_to_echo = NULL;
+    }
+
+    if (q_to_device != NULL)
+    {
+        printk(KERN_INFO "Disposing of 'to device' queue.\n");
+        kfree(q_to_device);
+        q_to_device = NULL;
+    }
+
+    printk(KERN_INFO "Cleanup complete.\n");
+}
+
+static int entry_point(void)
+{
+    printk(KERN_INFO "Module START!\n");
+
+    current_state = CSTATE_PREINIT;
+    requested_state = CSTATE_NONE;
+
+    char_dev_init();
+
+    interface_name = kmalloc(CHAR_DEV_MSG_MAX_LEN+1, (GFP_KERNEL | __GFP_ZERO));
+
+    if (interface_name == NULL)
+    {
+        printk(KERN_WARNING "Failed to allocate interface name string.\n");
+        goto err;
+    }
+
+    snprintf(interface_name, CHAR_DEV_MSG_MAX_LEN, "lo");
+    printk(KERN_WARNING "Allocated interface name string, default: %s.\n", interface_name);
+
+    q_to_log = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
+    q_to_echo = kmalloc(sizeof(PacketQueue_t), (GFP_KERNEL | __GFP_ZERO));
+
+    if (q_to_log == NULL
+        || q_to_echo == NULL)
+    {
+        printk(KERN_WARNING "Failed to allocate packet queues.\n");
+        goto err;
+    }
+
+    printk(KERN_INFO "Allocated packet queues.\n");
+
+    q_to_device = kmalloc(sizeof(CharQueue_t), (GFP_KERNEL | __GFP_ZERO));
+
+    if (q_to_device == NULL)
+    {
+        printk(KERN_WARNING "Failed to allocate 'to device' queue.\n");
+        goto err;
+    }
+
+    control_task_ptr = kthread_run(control_task, NULL, "ControlTask");
+
+    if (control_task_ptr == NULL)
+    {
+        printk(KERN_WARNING "Failed to start control task.\n");
+        goto err;
+    }
+
+    printk(KERN_INFO "Started control task.\n");
+
+    current_state = CSTATE_IDLE;
     return 0;
 
 err:

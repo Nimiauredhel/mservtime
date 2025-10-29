@@ -1,5 +1,5 @@
 #!/bin/bash
 
 echo "Stopping."
-echo "" > /dev/mservtime
+echo -n " " > /dev/mservtime
 echo "Stopped."
