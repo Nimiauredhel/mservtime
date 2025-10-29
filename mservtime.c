@@ -6,7 +6,6 @@
 #include <linux/delay.h>
 #include <linux/types.h>
 #include <linux/circ_buf.h>
-#include <linux/proc_fs.h>
 #include <linux/ktime.h>
 #include <linux/rtc.h>
 
@@ -21,6 +20,11 @@
 /* netfilter includes */
 #include <linux/netfilter.h>
 
+/* char device includes */
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/fs.h>
+
 #define BUFF_LEN (128)
 
 typedef struct PacketQueue
@@ -32,6 +36,12 @@ typedef struct PacketQueue
 
 static unsigned int ingress_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
 static void cleanup(void);
+
+static int char_dev_open(struct inode *inode, struct file *file);
+static int char_dev_release(struct inode *inode, struct file *file);
+static long char_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+static ssize_t char_dev_read(struct file *file, char __user *buf, size_t count, loff_t *offset);
+static ssize_t char_dev_write(struct file *file, const char __user *buf, size_t count, loff_t *offset);
 
 static struct task_struct *logger_task_ptr = NULL;
 static struct task_struct *echo_task_ptr = NULL;
@@ -46,6 +56,73 @@ struct nf_hook_ops ingress_hook_ops =
     .pf = NFPROTO_IPV4,
     .priority = 0,
 };
+
+/* character device variables */
+static dev_t char_dev = 0;
+static int char_dev_major = 0;
+static struct class *char_dev_class = NULL;
+static struct cdev char_dev_data;
+
+static const struct file_operations char_dev_fops =
+{
+    .owner = THIS_MODULE,
+    .open = char_dev_open,
+    .release = char_dev_release,
+    .unlocked_ioctl = char_dev_ioctl,
+    .read = char_dev_read,
+    .write = char_dev_write,
+};
+
+/* character device functions */
+static void char_dev_init(void)
+{
+    int ret = alloc_chrdev_region(&char_dev, 0, 1, "mservtime");
+    char_dev_major = MAJOR(char_dev);
+    char_dev_class = class_create("mservtime");
+    cdev_init(&char_dev_data, &char_dev_fops);
+    char_dev_data.owner = THIS_MODULE;
+    cdev_add(&char_dev_data, MKDEV(char_dev_major, 0), 1);
+    device_create(char_dev_class, NULL, MKDEV(char_dev_major, 0), NULL, "mservtime");
+}
+
+static void char_dev_deinit(void)
+{
+    device_destroy(char_dev_class, MKDEV(char_dev_major, 0));
+    class_unregister(char_dev_class);
+    class_destroy(char_dev_class);
+
+    unregister_chrdev_region(MKDEV(char_dev_major, 0), MINORMASK);
+}
+
+static int char_dev_open(struct inode *inode, struct file *file)
+{
+    printk("MYCHARDEV: Device open\n");
+    return 0;
+}
+
+static int char_dev_release(struct inode *inode, struct file *file)
+{
+    printk("MYCHARDEV: Device close\n");
+    return 0;
+}
+
+static long char_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    printk("MYCHARDEV: Device ioctl\n");
+    return 0;
+}
+
+static ssize_t char_dev_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
+{
+    printk("MYCHARDEV: Device read\n");
+    return 0;
+}
+
+static ssize_t char_dev_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
+{
+    printk("MYCHARDEV: Device write\n");
+    return 0;
+}
 
 static unsigned int ingress_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 {
@@ -255,6 +332,7 @@ static void cleanup(void)
 {
     printk(KERN_INFO "Cleaning up module.\n");
 
+    char_dev_deinit();
     nf_unregister_net_hook(&init_net, &ingress_hook_ops);
 
     if (logger_task_ptr != NULL)
@@ -291,6 +369,8 @@ static void cleanup(void)
 static int entry_point(void)
 {
     printk(KERN_INFO "Module START!\n");
+
+    char_dev_init();
 
     ingress_hook_ops.dev = dev_get_by_name(&init_net, "wlp1s0");
 
