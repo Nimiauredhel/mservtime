@@ -39,7 +39,6 @@ static void cleanup(void);
 
 static int char_dev_open(struct inode *inode, struct file *file);
 static int char_dev_release(struct inode *inode, struct file *file);
-static long char_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 static ssize_t char_dev_read(struct file *file, char __user *buf, size_t count, loff_t *offset);
 static ssize_t char_dev_write(struct file *file, const char __user *buf, size_t count, loff_t *offset);
 
@@ -68,7 +67,6 @@ static const struct file_operations char_dev_fops =
     .owner = THIS_MODULE,
     .open = char_dev_open,
     .release = char_dev_release,
-    .unlocked_ioctl = char_dev_ioctl,
     .read = char_dev_read,
     .write = char_dev_write,
 };
@@ -103,12 +101,6 @@ static int char_dev_open(struct inode *inode, struct file *file)
 static int char_dev_release(struct inode *inode, struct file *file)
 {
     printk("MYCHARDEV: Device close\n");
-    return 0;
-}
-
-static long char_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-    printk("MYCHARDEV: Device ioctl\n");
     return 0;
 }
 
