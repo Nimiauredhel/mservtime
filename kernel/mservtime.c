@@ -25,6 +25,7 @@
 #include <linux/device.h>
 #include <linux/fs.h>
 
+#define CHAR_DEV_MSG_MAX_LEN (128)
 #define BUFF_LEN (128)
 
 typedef struct PacketQueue
@@ -94,26 +95,41 @@ static void char_dev_deinit(void)
 
 static int char_dev_open(struct inode *inode, struct file *file)
 {
-    printk("MYCHARDEV: Device open\n");
+    printk("Device opened.\n");
     return 0;
 }
 
 static int char_dev_release(struct inode *inode, struct file *file)
 {
-    printk("MYCHARDEV: Device close\n");
+    printk("Device closed.\n");
     return 0;
 }
 
 static ssize_t char_dev_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
-    printk("MYCHARDEV: Device read\n");
-    return 0;
+    uint8_t *data = "Char device test message.\n\0";
+    size_t data_len = strlen(data);
+    size_t copied = 0;
+
+    copied = copy_to_user(buf, data, data_len);
+
+    printk("Device read len %lu/%lu: %s\n", data_len, count, data);
+    return data_len;
 }
 
 static ssize_t char_dev_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
 {
-    printk("MYCHARDEV: Device write\n");
-    return 0;
+    size_t max_len = CHAR_DEV_MSG_MAX_LEN;
+    size_t copied = 0;
+    char data[CHAR_DEV_MSG_MAX_LEN+1];
+
+    if (count < max_len) max_len = count;
+
+    copied = copy_from_user(data, buf, max_len);
+    data[CHAR_DEV_MSG_MAX_LEN] = 0;
+
+    printk("Device write: %s\n", data);
+    return count;
 }
 
 static unsigned int ingress_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
