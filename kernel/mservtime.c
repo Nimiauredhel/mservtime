@@ -123,14 +123,12 @@ static void char_dev_deinit(void)
 static int char_dev_open(struct inode *inode, struct file *file)
 {
     if (current_state < CSTATE_IDLE) return 1;
-    printk("Device opened.\n");
     return 0;
 }
 
 static int char_dev_release(struct inode *inode, struct file *file)
 {
     if (current_state < CSTATE_IDLE) return 1;
-    printk("Device closed.\n");
     return 0;
 }
 
@@ -147,8 +145,6 @@ static ssize_t char_dev_read(struct file *file, char __user *buf, size_t count, 
         if (count < data_len) data_len = count;
 
         copied = copy_to_user(buf, data, data_len);
-
-        printk("Device read len %lu/%lu: %s\n", data_len, count, data);
 
         q_to_device->tail = (q_to_device->tail + 1) % CHAR_DEV_QUEUE_LEN;
 
